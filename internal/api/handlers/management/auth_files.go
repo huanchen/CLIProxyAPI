@@ -250,20 +250,9 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		c.Data(200, "application/json; charset=utf-8", payload)
 		return
 	}
-	// 缓存尚未预热（启动后首次请求）：实时构建一次
-	auths := h.authManager.List()
-	files := make([]gin.H, 0, len(auths))
-	for _, auth := range auths {
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
-			files = append(files, entry)
-		}
-	}
-	sort.Slice(files, func(i, j int) bool {
-		nameI, _ := files[i]["name"].(string)
-		nameJ, _ := files[j]["name"].(string)
-		return strings.ToLower(nameI) < strings.ToLower(nameJ)
-	})
-	c.JSON(200, gin.H{"files": files})
+	// 缓存尚未预热（启动后首次请求）：立即返回空列表，后台会在 10s 内建好缓存
+	// 绝不调用 manager.List()，避免在高锁竞争时 30s 阻塞
+	c.JSON(200, gin.H{"files": []any{}, "initializing": true})
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file

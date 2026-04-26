@@ -85,6 +85,10 @@ type Service struct {
 	// coreManager handles core authentication and execution.
 	coreManager *coreauth.Manager
 
+	// authSnapshot is an event-driven auth list snapshot updated via hook callbacks.
+	// Used by the management API instead of manager.List() to avoid lock contention.
+	authSnapshot *sdkAuth.AuthSnapshot
+
 	// shutdownOnce ensures shutdown is called only once.
 	shutdownOnce sync.Once
 
@@ -99,6 +103,15 @@ type Service struct {
 //   - plugin: The usage plugin to register
 func (s *Service) RegisterUsagePlugin(plugin usage.Plugin) {
 	usage.RegisterPlugin(plugin)
+}
+
+// GetAuthSnapshot returns the event-driven auth snapshot for use by the
+// management API handler (avoids calling manager.List() under lock contention).
+func (s *Service) GetAuthSnapshot() *sdkAuth.AuthSnapshot {
+	if s == nil {
+		return nil
+	}
+	return s.authSnapshot
 }
 
 // newDefaultAuthManager creates a default authentication manager with all supported providers.
@@ -521,6 +534,11 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+
+	// 注入事件驱动快照，让管理 API 不调用 manager.List() 避免锁竞争
+	if s.authSnapshot != nil && s.server != nil {
+		s.server.SetAuthSnapshot(s.authSnapshot)
+	}
 
 	if s.authManager == nil {
 		s.authManager = newDefaultAuthManager()

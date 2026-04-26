@@ -111,8 +111,9 @@ type Handler struct {
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
 	bcryptCache         bcryptCache
-	statCache           *fileStatCache      // auth 文件 stat 缓存
-	authListCache       *authFileListCache  // auth-files 完整响应缓存，后台刷新
+	statCache           *fileStatCache     // auth 文件 stat 缓存
+	authListCache       *authFileListCache // auth-files 完整响应缓存，后台刷新
+	authSnapshot        *sdkAuth.AuthSnapshot // 事件驱动快照，零 manager 锁竞争
 }
 
 // NewHandler creates a new management handler instance.
@@ -169,14 +170,19 @@ func (h *Handler) purgeStaleAttempts() {
 
 
 // startAuthListCacheRefresh 后台每 10s 重建一次完整的 auth-files JSON 响应缓存。
-// ListAuthFiles 直接返回缓存，完全避免请求时调用 manager.List() 和 os.Stat()。
+// 优先使用 authSnapshot（事件驱动，零 manager 锁竞争），彻底解决 30s 卡顿。
 func (h *Handler) startAuthListCacheRefresh() {
 	rebuild := func() {
-		if h.authManager == nil {
+		// 优先：从事件驱动快照读取，不涉及 manager 全局锁
+		var auths []*coreauth.Auth
+		if h.authSnapshot != nil && h.authSnapshot.Len() > 0 {
+			auths = h.authSnapshot.List()
+		} else if h.authManager != nil {
+			auths = h.authManager.List()
+		}
+		if len(auths) == 0 {
 			return
 		}
-		// 在后台 goroutine 里做耗时操作，不阻塞任何请求
-		auths := h.authManager.List()
 
 		// 批量 os.Stat（后台做，不影响请求）
 		statEntries := make(map[string]fileStatInfo, len(auths))
@@ -251,6 +257,15 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	h.mu.Lock()
 	h.authManager = manager
 	h.mu.Unlock()
+}
+
+// SetAuthSnapshot sets the event-driven auth snapshot so ListAuthFiles can
+// serve responses without calling manager.List() (which blocks under lock contention).
+func (h *Handler) SetAuthSnapshot(s *sdkAuth.AuthSnapshot) {
+	if h == nil {
+		return
+	}
+	h.authSnapshot = s
 }
 
 // SetUsageStatistics allows replacing the usage statistics reference.

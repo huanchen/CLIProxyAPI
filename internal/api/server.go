@@ -701,6 +701,15 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	c.File(filePath)
 }
 
+// SetAuthSnapshot injects the event-driven auth snapshot into the management handler
+// so ListAuthFiles can serve without calling manager.List() under lock contention.
+func (s *Server) SetAuthSnapshot(snapshot *sdkAuth.AuthSnapshot) {
+	if s == nil || s.mgmt == nil || snapshot == nil {
+		return
+	}
+	s.mgmt.SetAuthSnapshot(snapshot)
+}
+
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {
 	if timeout <= 0 || onTimeout == nil {
 		return

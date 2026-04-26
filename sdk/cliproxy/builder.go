@@ -202,6 +202,7 @@ func (b *Builder) Build() (*Service, error) {
 	accessManager.SetProviders(sdkaccess.RegisteredProviders())
 
 	coreManager := b.coreManager
+	var authSnapshotVal *sdkAuth.AuthSnapshot
 	if coreManager == nil {
 		tokenStore := sdkAuth.GetTokenStore()
 		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
@@ -247,6 +248,9 @@ func (b *Builder) Build() (*Service, error) {
 
 		monitor.SetManager(coreManager)
 		monitor.Start() // 始终启动，不受 backupEnabled flag 控制
+
+		// 把快照存到 authSnapshot，后续传给 service
+		authSnapshotVal = backupHook.GetSnapshot()
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
@@ -263,6 +267,7 @@ func (b *Builder) Build() (*Service, error) {
 		authManager:    authManager,
 		accessManager:  accessManager,
 		coreManager:    coreManager,
+		authSnapshot:   authSnapshotVal,
 		serverOptions:  append([]api.ServerOption(nil), b.serverOptions...),
 	}
 	return service, nil
