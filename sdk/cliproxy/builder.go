@@ -239,20 +239,14 @@ func (b *Builder) Build() (*Service, error) {
 
 		backupEnabled := b.cfg != nil && b.cfg.UnauthorizedBackup.IsEnabled()
 
-		var authHook coreauth.Hook
-		var backupFileStore *sdkAuth.FileTokenStore
-		if fileStore, ok := tokenStore.(*sdkAuth.FileTokenStore); ok {
-			backupFileStore = fileStore
-			authHook = sdkAuth.NewBackupOnUnauthorizedHook(nil, fileStore, backupEnabled)
-		}
+		monitor := sdkAuth.NewAuthHealthMonitor(nil)
+		backupHook := sdkAuth.NewBackupOnUnauthorizedHook(nil, nil, backupEnabled)
+		backupHook.SetMonitor(monitor)
 
-		coreManager = coreauth.NewManager(tokenStore, selector, authHook)
+		coreManager = coreauth.NewManager(tokenStore, selector, backupHook)
 
-		if backupEnabled && backupFileStore != nil {
-			scanInterval := b.cfg.UnauthorizedBackup.GetScanInterval()
-			scanner := sdkAuth.NewBackupScanner(backupFileStore, coreManager, scanInterval)
-			scanner.Start()
-		}
+		monitor.SetManager(coreManager)
+		monitor.Start() // 始终启动，不受 backupEnabled flag 控制
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())

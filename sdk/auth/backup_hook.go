@@ -5,32 +5,35 @@ import (
 	"sync/atomic"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
 )
 
-// BackupOnUnauthorizedHook wraps an existing Hook and triggers 401-bak
-// file movement when execution results indicate a 401 unauthorized error.
+// BackupOnUnauthorizedHook wraps an existing Hook and forwards antigravity
+// 40x/50x results to the AuthHealthMonitor for async disable + recovery.
 type BackupOnUnauthorizedHook struct {
 	inner   cliproxyauth.Hook
-	store   *FileTokenStore
+	monitor *AuthHealthMonitor
 	enabled atomic.Bool
 }
 
-// NewBackupOnUnauthorizedHook creates a hook that delegates to inner and
-// additionally moves auth files to 401-bak on 401 errors.
-func NewBackupOnUnauthorizedHook(inner cliproxyauth.Hook, store *FileTokenStore, enabled bool) *BackupOnUnauthorizedHook {
+// NewBackupOnUnauthorizedHook creates the hook. monitor may be nil initially
+// and set later via SetMonitor.
+func NewBackupOnUnauthorizedHook(inner cliproxyauth.Hook, manager *cliproxyauth.Manager, enabled bool) *BackupOnUnauthorizedHook {
 	if inner == nil {
 		inner = cliproxyauth.NoopHook{}
 	}
-	h := &BackupOnUnauthorizedHook{inner: inner, store: store}
+	h := &BackupOnUnauthorizedHook{inner: inner}
 	h.enabled.Store(enabled)
 	return h
 }
 
-// SetEnabled dynamically toggles the 401-bak backup feature.
-func (h *BackupOnUnauthorizedHook) SetEnabled(v bool) {
-	h.enabled.Store(v)
-}
+// SetMonitor injects the health monitor after it is created.
+func (h *BackupOnUnauthorizedHook) SetMonitor(m *AuthHealthMonitor) { h.monitor = m }
+
+// SetManager is a no-op kept for API compatibility.
+func (h *BackupOnUnauthorizedHook) SetManager(_ *cliproxyauth.Manager) {}
+
+// SetEnabled toggles the feature at runtime.
+func (h *BackupOnUnauthorizedHook) SetEnabled(v bool) { h.enabled.Store(v) }
 
 func (h *BackupOnUnauthorizedHook) OnAuthRegistered(ctx context.Context, auth *cliproxyauth.Auth) {
 	h.inner.OnAuthRegistered(ctx, auth)
@@ -43,24 +46,23 @@ func (h *BackupOnUnauthorizedHook) OnAuthUpdated(ctx context.Context, auth *clip
 func (h *BackupOnUnauthorizedHook) OnResult(ctx context.Context, result cliproxyauth.Result) {
 	h.inner.OnResult(ctx, result)
 
-	if !h.enabled.Load() {
+	if h.monitor == nil {
 		return
 	}
-	if result.Error == nil || result.Success {
+	if result.Provider != "antigravity" || result.AuthID == "" {
 		return
 	}
-	if result.Error.HTTPStatus != 401 {
+	// 成功时重置失败计数，防止历史失败累积误杀健康账号
+	if result.Success {
+		h.monitor.ResetFailures(result.AuthID)
 		return
 	}
-	if h.store == nil || result.AuthID == "" {
+	if !h.enabled.Load() || result.Error == nil {
 		return
 	}
-
-	auth := &cliproxyauth.Auth{
-		ID:       result.AuthID,
-		FileName: result.AuthID,
-	}
-	if err := h.store.MoveToBackup(ctx, auth); err != nil {
-		log.Warnf("401-bak hook: move failed for %s: %v", maskSensitiveID(result.AuthID), err)
+	code := result.Error.HTTPStatus
+	if code == 401 || code == 402 || code == 403 ||
+		code == 500 || code == 502 || code == 503 || code == 504 {
+		h.monitor.Trigger(result.AuthID, result.Provider, code)
 	}
 }

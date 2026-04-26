@@ -27,11 +27,50 @@ type attemptInfo struct {
 	lastActivity time.Time // track last activity for cleanup
 }
 
+// bcryptCache caches a recently verified (plaintext, hash) pair to avoid
+// repeated expensive bcrypt calls on every management API request.
+type bcryptCache struct {
+	mu         sync.Mutex
+	plaintext  string
+	secretHash string
+}
+
 // attemptCleanupInterval controls how often stale IP entries are purged
 const attemptCleanupInterval = 1 * time.Hour
 
 // attemptMaxIdleTime controls how long an IP can be idle before cleanup
 const attemptMaxIdleTime = 2 * time.Hour
+
+// fileStatInfo caches the result of os.Stat for a single auth file.
+type fileStatInfo struct {
+	size    int64
+	modTime time.Time
+	missing bool // true when the file did not exist at last check
+}
+
+// fileStatCache caches os.Stat results for auth file paths, refreshed in the
+// background so ListAuthFiles never blocks on disk I/O.
+type fileStatCache struct {
+	mu      sync.RWMutex
+	entries map[string]fileStatInfo // path -> info
+}
+
+func newFileStatCache() *fileStatCache {
+	return &fileStatCache{entries: make(map[string]fileStatInfo)}
+}
+
+func (c *fileStatCache) get(path string) (fileStatInfo, bool) {
+	c.mu.RLock()
+	info, ok := c.entries[path]
+	c.mu.RUnlock()
+	return info, ok
+}
+
+func (c *fileStatCache) setAll(entries map[string]fileStatInfo) {
+	c.mu.Lock()
+	c.entries = entries
+	c.mu.Unlock()
+}
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
@@ -48,6 +87,8 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	bcryptCache         bcryptCache
+	statCache           *fileStatCache // auth 文件 stat 缓存，后台刷新
 }
 
 // NewHandler creates a new management handler instance.
@@ -64,8 +105,10 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+		statCache:           newFileStatCache(),
 	}
 	h.startAttemptCleanup()
+	h.startStatCacheRefresh()
 	return h
 }
 
@@ -97,6 +140,47 @@ func (h *Handler) purgeStaleAttempts() {
 			delete(h.failedAttempts, ip)
 		}
 	}
+}
+
+// startStatCacheRefresh launches a background goroutine that pre-warms and
+// periodically refreshes the file stat cache so ListAuthFiles never blocks
+// on disk I/O (1300 os.Stat calls per request → read from cache instead).
+func (h *Handler) startStatCacheRefresh() {
+	refresh := func() {
+		if h.authManager == nil {
+			return
+		}
+		auths := h.authManager.List()
+		entries := make(map[string]fileStatInfo, len(auths))
+		for _, auth := range auths {
+			if auth == nil {
+				continue
+			}
+			path := strings.TrimSpace(authAttribute(auth, "path"))
+			if path == "" {
+				continue
+			}
+			if _, seen := entries[path]; seen {
+				continue
+			}
+			info, err := os.Stat(path)
+			if err == nil {
+				entries[path] = fileStatInfo{size: info.Size(), modTime: info.ModTime()}
+			} else if os.IsNotExist(err) {
+				entries[path] = fileStatInfo{missing: true}
+			}
+		}
+		h.statCache.setAll(entries)
+	}
+	// pre-warm immediately
+	go refresh()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			refresh()
+		}
+	}()
 }
 
 // NewHandler creates a new management handler instance.
@@ -277,11 +361,30 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 		return true, 0, ""
 	}
 
-	if secretHash == "" || bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) != nil {
+	if secretHash == "" {
 		if !localClient {
 			fail()
 		}
 		return false, http.StatusUnauthorized, "invalid management key"
+	}
+
+	// Use cached result to avoid bcrypt on every request (bcrypt cost ~100-300ms).
+	// Cache stores the last successfully verified (plaintext, hash) pair.
+	h.bcryptCache.mu.Lock()
+	cacheHit := h.bcryptCache.plaintext == provided && h.bcryptCache.secretHash == secretHash
+	h.bcryptCache.mu.Unlock()
+
+	if !cacheHit {
+		if bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) != nil {
+			if !localClient {
+				fail()
+			}
+			return false, http.StatusUnauthorized, "invalid management key"
+		}
+		h.bcryptCache.mu.Lock()
+		h.bcryptCache.plaintext = provided
+		h.bcryptCache.secretHash = secretHash
+		h.bcryptCache.mu.Unlock()
 	}
 
 	if !localClient {

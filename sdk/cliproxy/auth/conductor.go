@@ -23,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -148,6 +149,13 @@ type Manager struct {
 	mu        sync.RWMutex
 	auths     map[string]*Auth
 	scheduler *authScheduler
+	// refreshGroup deduplicates concurrent refresh calls for the same auth ID,
+	// preventing refresh_token_reused errors caused by racing goroutines.
+	refreshGroup singleflight.Group
+	// forceRefreshGroup deduplicates concurrent ForceRefreshAuth calls.
+	// Kept separate from refreshGroup so force-refresh always executes its own
+	// logic and is never silently subsumed by an in-flight auto-refresh.
+	forceRefreshGroup singleflight.Group
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
@@ -3451,6 +3459,16 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Deduplicate concurrent refresh calls for the same auth ID.
+	// This prevents refresh_token_reused errors caused by multiple goroutines
+	// racing to refresh the same credential at the same time.
+	m.refreshGroup.Do(id, func() (any, error) {
+		m.refreshAuthOnce(ctx, id)
+		return nil, nil
+	})
+}
+
+func (m *Manager) refreshAuthOnce(ctx context.Context, id string) {
 	m.mu.RLock()
 	auth := m.auths[id]
 	var exec ProviderExecutor
@@ -3471,10 +3489,26 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		// refresh_token_reused does NOT mean the account is dead. It means:
+		// - a previous refresh succeeded and the old token was consumed, but
+		//   the new token may not have been saved back (e.g. service restart mid-refresh)
+		// - the access token may still be valid and the account still has quota
+		// Use a long backoff so we stop hammering the refresh endpoint,
+		// but keep the auth active so business requests can still use the access token.
+		errMsg := strings.ToLower(err.Error())
+		isStaleToken := strings.Contains(errMsg, "refresh_token_reused") ||
+			strings.Contains(errMsg, "invalid_grant")
+		backoff := refreshFailureBackoff
+		if isStaleToken {
+			// Back off for 2 hours — long enough to stop the storm, but the
+			// account remains active in the selector for ongoing business requests.
+			backoff = 2 * time.Hour
+			log.Warnf("refreshAuth: stale refresh token for %s, backing off 2h (account stays active)", id)
+		}
 		shouldReschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+			current.NextRefreshAfter = now.Add(backoff)
 			current.LastError = &Error{Message: err.Error()}
 			m.auths[id] = current
 			shouldReschedule = true
@@ -3504,6 +3538,85 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
 	_, _ = m.Update(ctx, updated)
+}
+
+// ForceRefreshAuth refreshes credentials for the given auth even when it is
+// disabled. On success the auth is re-enabled. On failure the LastError is
+// updated and the auth remains disabled.
+// Uses the same singleflight key as the auto-refresh loop to prevent
+// concurrent token refreshes for the same auth.
+func (m *Manager) ForceRefreshAuth(ctx context.Context, authID string) error {
+	_, err, _ := m.forceRefreshGroup.Do(authID, func() (any, error) {
+		return nil, m.forceRefreshAuthOnce(ctx, authID)
+	})
+	return err
+}
+
+func (m *Manager) forceRefreshAuthOnce(ctx context.Context, authID string) error {
+	m.mu.RLock()
+	auth := m.auths[authID]
+	var exec ProviderExecutor
+	if auth != nil {
+		exec = m.executors[auth.Provider]
+	}
+	m.mu.RUnlock()
+	if auth == nil || exec == nil {
+		return errors.New("auth not found or no executor")
+	}
+	cloned := auth.Clone()
+	updated, err := exec.Refresh(ctx, cloned)
+	now := time.Now()
+	if err != nil {
+		// Walk through Update so state is persisted and scheduler is notified.
+		m.mu.RLock()
+		cur := m.auths[authID]
+		m.mu.RUnlock()
+		if cur != nil {
+			failing := cur.Clone()
+			failing.LastError = &Error{Message: err.Error()}
+			failing.UpdatedAt = now
+			_, _ = m.Update(ctx, failing)
+		}
+		log.Debugf("force-refresh failed for %s: %v", authID, err)
+		return err
+	}
+	if updated == nil {
+		updated = cloned
+	}
+	if updated.Runtime == nil {
+		updated.Runtime = auth.Runtime
+	}
+	// Re-enable and clear error state on success.
+	updated.Disabled = false
+	updated.Status = StatusActive
+	updated.StatusMessage = ""
+	updated.LastError = nil
+	updated.Unavailable = false
+	updated.LastRefreshedAt = now
+	updated.NextRefreshAfter = time.Time{}
+	updated.NextRetryAfter = time.Time{}
+	updated.UpdatedAt = now
+	if m.shouldRefresh(updated, now) {
+		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
+	}
+	_, err = m.Update(ctx, updated)
+	if err == nil {
+		log.Infof("force-refresh succeeded, re-enabled %s (%s)", authID, auth.Provider)
+	}
+	return err
+}
+
+// TriggerRefresh schedules an immediate refresh for a non-disabled auth by
+// zeroing its refresh timestamps so the auto-refresh loop picks it up within
+// the next check interval.
+func (m *Manager) TriggerRefresh(authID string) {
+	m.mu.Lock()
+	if auth, ok := m.auths[authID]; ok && auth != nil && !auth.Disabled {
+		auth.LastRefreshedAt = time.Time{}
+		auth.NextRefreshAfter = time.Time{}
+	}
+	m.mu.Unlock()
+	m.queueRefreshReschedule(authID)
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {

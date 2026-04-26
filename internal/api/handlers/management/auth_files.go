@@ -415,17 +415,30 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if path != "" {
 		entry["path"] = path
 		entry["source"] = "file"
-		if info, err := os.Stat(path); err == nil {
-			entry["size"] = info.Size()
-			entry["modtime"] = info.ModTime()
-		} else if os.IsNotExist(err) {
-			// Hide credentials removed from disk but still lingering in memory.
-			if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
-				return nil
+		if cached, ok := h.statCache.get(path); ok {
+			if cached.missing {
+				// File removed from disk but still in memory.
+				if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
+					return nil
+				}
+				entry["source"] = "memory"
+			} else {
+				entry["size"] = cached.size
+				entry["modtime"] = cached.modTime
 			}
-			entry["source"] = "memory"
 		} else {
-			log.WithError(err).Warnf("failed to stat auth file %s", path)
+			// Cache miss (first request before pre-warm finishes): fall back to os.Stat once.
+			if info, err := os.Stat(path); err == nil {
+				entry["size"] = info.Size()
+				entry["modtime"] = info.ModTime()
+			} else if os.IsNotExist(err) {
+				if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
+					return nil
+				}
+				entry["source"] = "memory"
+			} else {
+				log.WithError(err).Warnf("failed to stat auth file %s", path)
+			}
 		}
 	}
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {

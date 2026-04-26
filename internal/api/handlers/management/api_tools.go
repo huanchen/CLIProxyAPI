@@ -632,8 +632,11 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 }
 
 func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
+	// Management API calls should NOT use proxy by default
+	// Only use proxy when explicitly configured for the specific auth credential
 	var proxyCandidates []string
 	if auth != nil {
+		// Only use auth-specific proxy if explicitly set
 		if proxyStr := strings.TrimSpace(auth.ProxyURL); proxyStr != "" {
 			proxyCandidates = append(proxyCandidates, proxyStr)
 		}
@@ -643,11 +646,8 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
 			}
 		}
 	}
-	if h != nil && h.cfg != nil {
-		if proxyStr := strings.TrimSpace(h.cfg.ProxyURL); proxyStr != "" {
-			proxyCandidates = append(proxyCandidates, proxyStr)
-		}
-	}
+	// DO NOT use global proxy for management API calls
+	// This ensures management page loads quickly without proxy overhead
 
 	for _, proxyStr := range proxyCandidates {
 		if transport := buildProxyTransport(proxyStr); transport != nil {
@@ -655,6 +655,7 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
 		}
 	}
 
+	// Return direct transport (no proxy)
 	transport, ok := http.DefaultTransport.(*http.Transport)
 	if !ok || transport == nil {
 		return &http.Transport{Proxy: nil}

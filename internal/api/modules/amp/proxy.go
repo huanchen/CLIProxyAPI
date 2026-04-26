@@ -64,6 +64,19 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(parsed)
+
+	// Use a direct transport (no system proxy) for the Amp upstream reverse proxy.
+	// The management page and Amp API calls should NOT go through any system/env proxy,
+	// as that causes slow page loads. Business API requests go through their own proxy
+	// logic configured per-credential elsewhere.
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+		direct := base.Clone()
+		direct.Proxy = nil // disable env-based proxy (HTTP_PROXY / HTTPS_PROXY)
+		proxy.Transport = direct
+	} else {
+		proxy.Transport = &http.Transport{Proxy: nil}
+	}
+
 	originalDirector := proxy.Director
 
 	// Modify outgoing requests to inject API key and fix routing
