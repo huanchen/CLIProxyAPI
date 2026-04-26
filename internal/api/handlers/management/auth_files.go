@@ -244,6 +244,13 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		h.listAuthFilesFromDisk(c)
 		return
 	}
+	// 直接返回后台预建的缓存，零 manager.List() 调用，零 os.Stat 调用
+	if payload, builtAt := h.authListCache.get(); len(payload) > 0 {
+		c.Header("X-Cache-Age", fmt.Sprintf("%.0fs", time.Since(builtAt).Seconds()))
+		c.Data(200, "application/json; charset=utf-8", payload)
+		return
+	}
+	// 缓存尚未预热（启动后首次请求）：实时构建一次
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {

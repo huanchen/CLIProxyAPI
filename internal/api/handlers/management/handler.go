@@ -4,10 +4,12 @@ package management
 
 import (
 	"crypto/subtle"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +42,27 @@ const attemptCleanupInterval = 1 * time.Hour
 
 // attemptMaxIdleTime controls how long an IP can be idle before cleanup
 const attemptMaxIdleTime = 2 * time.Hour
+
+// authFileListCache caches the full serialized auth-files response so that
+// ListAuthFiles never blocks on manager.List() or os.Stat under load.
+type authFileListCache struct {
+	mu      sync.RWMutex
+	payload []byte    // pre-serialized JSON: {"files":[...]}
+	builtAt time.Time // when the cache was last built
+}
+
+func (c *authFileListCache) get() ([]byte, time.Time) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.payload, c.builtAt
+}
+
+func (c *authFileListCache) set(payload []byte) {
+	c.mu.Lock()
+	c.payload = payload
+	c.builtAt = time.Now()
+	c.mu.Unlock()
+}
 
 // fileStatInfo caches the result of os.Stat for a single auth file.
 type fileStatInfo struct {
@@ -88,7 +111,8 @@ type Handler struct {
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
 	bcryptCache         bcryptCache
-	statCache           *fileStatCache // auth 文件 stat 缓存，后台刷新
+	statCache           *fileStatCache      // auth 文件 stat 缓存
+	authListCache       *authFileListCache  // auth-files 完整响应缓存，后台刷新
 }
 
 // NewHandler creates a new management handler instance.
@@ -106,9 +130,10 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
 		statCache:           newFileStatCache(),
+		authListCache:       &authFileListCache{},
 	}
 	h.startAttemptCleanup()
-	h.startStatCacheRefresh()
+	h.startAuthListCacheRefresh()
 	return h
 }
 
@@ -142,46 +167,66 @@ func (h *Handler) purgeStaleAttempts() {
 	}
 }
 
-// startStatCacheRefresh launches a background goroutine that pre-warms and
-// periodically refreshes the file stat cache so ListAuthFiles never blocks
-// on disk I/O (1300 os.Stat calls per request → read from cache instead).
-func (h *Handler) startStatCacheRefresh() {
-	refresh := func() {
+
+// startAuthListCacheRefresh 后台每 10s 重建一次完整的 auth-files JSON 响应缓存。
+// ListAuthFiles 直接返回缓存，完全避免请求时调用 manager.List() 和 os.Stat()。
+func (h *Handler) startAuthListCacheRefresh() {
+	rebuild := func() {
 		if h.authManager == nil {
 			return
 		}
+		// 在后台 goroutine 里做耗时操作，不阻塞任何请求
 		auths := h.authManager.List()
-		entries := make(map[string]fileStatInfo, len(auths))
+
+		// 批量 os.Stat（后台做，不影响请求）
+		statEntries := make(map[string]fileStatInfo, len(auths))
 		for _, auth := range auths {
 			if auth == nil {
 				continue
 			}
 			path := strings.TrimSpace(authAttribute(auth, "path"))
-			if path == "" {
-				continue
-			}
-			if _, seen := entries[path]; seen {
+			if path == "" || statEntries[path].size != 0 {
 				continue
 			}
 			info, err := os.Stat(path)
 			if err == nil {
-				entries[path] = fileStatInfo{size: info.Size(), modTime: info.ModTime()}
+				statEntries[path] = fileStatInfo{size: info.Size(), modTime: info.ModTime()}
 			} else if os.IsNotExist(err) {
-				entries[path] = fileStatInfo{missing: true}
+				statEntries[path] = fileStatInfo{missing: true}
 			}
 		}
-		h.statCache.setAll(entries)
+		h.statCache.setAll(statEntries)
+
+		// 构建响应列表
+		files := make([]gin.H, 0, len(auths))
+		for _, auth := range auths {
+			if entry := h.buildAuthFileEntry(auth); entry != nil {
+				files = append(files, entry)
+			}
+		}
+		sort.Slice(files, func(i, j int) bool {
+			nameI, _ := files[i]["name"].(string)
+			nameJ, _ := files[j]["name"].(string)
+			return strings.ToLower(nameI) < strings.ToLower(nameJ)
+		})
+
+		payload, err := json.Marshal(gin.H{"files": files})
+		if err == nil {
+			h.authListCache.set(payload)
+		}
 	}
-	// pre-warm immediately
-	go refresh()
+
+	// 立即预热
+	go rebuild()
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			refresh()
+			rebuild()
 		}
 	}()
 }
+
 
 // NewHandler creates a new management handler instance.
 func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manager) *Handler {
